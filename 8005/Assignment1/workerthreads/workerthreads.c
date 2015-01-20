@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------
--- SOURCE FILE: workerprocs.c - A program to measure child process performance
+-- SOURCE FILE: workerthreads.c - A program to measure thread performance
 -- 
--- PROGRAM: workerprocs.exe
+-- PROGRAM: workerthreads.exe
 -- 
 -- DATE: January 18, 2015
 -- 
@@ -12,34 +12,50 @@
 -- PROGRAMMERS: Christopher Eng
 -- 
 -- NOTES:
--- The program will get its child processes to calculate prime number decomposition for a user argument.
--- The program will calculate how long each child process takes to complete the calculation and write to a file.
+-- The program will get its threads to calculate prime number decomposition for a user argument.
+-- The program will calculate how long each thread takes to complete the calculation and write to a file.
 -----------------------------------------------------------------------------*/
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
 #include <gmp.h>
+#include <pthread.h>
 #include <sys/time.h>
+#include <sys/syscall.h>
 
 #include "primedecompose.h"
 
 #define MAX_FACTORS	1024
-#define FILENAME "workerprocs_output.txt"
+#define FILENAME "workerthreads_output.txt"
 #define MSGSIZE 50
 #define DEFAULTCOUNT 5
 
-int parent(int, int[]);
-int child(char*, int[]);
+int parent(int);
+void* child(void *);
 long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
+
+// mutex variable
+pthread_mutex_t time_lock = PTHREAD_MUTEX_INITIALIZER;
+char buf[MSGSIZE];
+int data_read = 1;
+
+typedef struct
+{
+  char* Prime;
+} ThreadInfo;
 
 int main (int argc, char *argv[]) 
 {
-  pid_t childpid = 0; 
-  int pfd[2];
+  ThreadInfo *info_ptr;
   int count;
+
+  if ((info_ptr = malloc (sizeof (ThreadInfo))) == NULL)
+  {
+    perror ("malloc");
+    exit (1);
+  }
 
   switch (argc)
   {
@@ -50,67 +66,50 @@ int main (int argc, char *argv[])
       count = DEFAULTCOUNT;
       break;
     default:
-      fprintf(stderr, "Usage: <number to be factored> <optional: number of child processes>\n");
+      fprintf(stderr, "Usage: <number to be factored> <optional: number of threads>\n");
       return 1;
   }
+
+  pthread_t thread_id[count];
+  info_ptr->Prime = argv[1];
 
   // recreate file
   FILE *fp;
   fp = fopen(FILENAME, "w");
-  fprintf(fp, "%s\n", "ProcessID | Calculation Output                       | Execution Time (usec)");
+  fprintf(fp, "%s\n", "ThreadID  | Calculation Output                       | Execution Time (usec)");
   fprintf(fp, "%s\n", "____________________________________________________________________________");
   fclose(fp);
 
-  // open pipe
-  if (pipe(pfd) < 0)
-  {
-    perror("pipe call");
-    exit(1);
-  }
-
   int i;
   for (i = 0; i < count; i++)
   {
-    childpid = fork();
-    if (childpid == 0) // child
-    {
-     	fprintf(stderr, "Created child process %ld\n", (long) getpid());
-
-      child(argv[1], pfd);
-      break;
-    }
-    else if (childpid < 0) // error occurred
-    {
-      perror("fork failed\n");
-      return 1;
-    }
+    pthread_create(&thread_id[i], NULL, child, (void*) info_ptr);
   }
 
-  if (childpid > 0)
-  {
-    parent(count, pfd);
-    printf("Parent process finished executing\n");
-    exit(0);
-  }
-
-  return 1;
+  parent(count);
+  // free info_ptr after parent has received verification that thread finished exec
+  free(info_ptr);
+  return 0; 
 }
 
-int parent(int count, int p[2])
+int parent(int count)
 {
-  char buf[MSGSIZE];
+  int value = 0;
   long long result = 0;
 
-  // close write descriptor 
-  close(p[1]);
-
-  int i;
-  for (i = 0; i < count; i++)
-  {
-    if (read(p[0], buf, MSGSIZE) > 0)
+  while (value != count)
+  { 
+    // mutex lock thread for global variable
+    pthread_mutex_lock(&time_lock);
+   
+    if (data_read == 0)
     {
       result += strtoll(buf, NULL, 0);
+      data_read = 1;
+      value++;
     }
+
+    pthread_mutex_unlock(&time_lock);
   }
 
   FILE* fp;
@@ -123,18 +122,16 @@ int parent(int count, int p[2])
   return EXIT_SUCCESS;
 }
 
-int child(char* prime, int p[2])
+void* child(void *info_ptr)
 {
-  long process_id = (long) getpid();
+  ThreadInfo* user_info = (ThreadInfo*) info_ptr;
+  pid_t thread_id = syscall(SYS_gettid);
 
   mpz_t dest[MAX_FACTORS];
 	mpz_t n;
   int i, l;
-  char output[200], calculation[100] = "", diff[MSGSIZE];
+  char output[200], calculation[100] = "";
   struct timeval start, end;
-
-  // close read descriptor
-  close(p[0]);
 
   // set start time
   if (gettimeofday(&start, NULL))
@@ -144,7 +141,7 @@ int child(char* prime, int p[2])
   }
 
   // prime computation
-  mpz_init_set_str(n, prime, 10);
+  mpz_init_set_str(n, user_info->Prime, 10);
   l = decompose(n, dest);
  
   for(i = 0; i < l; i++) 
@@ -153,11 +150,12 @@ int child(char* prime, int p[2])
     mpz_clear(dest[i]);
   }
 
+  // format output
+  sprintf(output, "%*i | %-*s | ", 9, thread_id, 40, calculation);
+
   // file io
   FILE *fp;
   fp = fopen(FILENAME, "a");
-  // format output
-  sprintf(output, "%*ld | %-*s | ", 9, process_id, 40, calculation);
   fprintf(fp, "%s", output);
 
   // get end time
@@ -167,17 +165,29 @@ int child(char* prime, int p[2])
     exit(1);
   }
 
-  // get elapsed time
-  sprintf(diff, "%lld", timeval_diff(NULL, &end, &start));
-  fprintf(fp, "%s\n", diff);
+  // mutex lock thread for global variables, data_read & buf
+  int data_saved = 0;
+  do
+  {
+    pthread_mutex_lock(&time_lock);
 
-  fclose(fp);
+    // parent thread has read the latest buf value, safe to set it again
+    if (data_read == 1)
+    {
+      // get elapsed time
+      sprintf(buf, "%lld", timeval_diff(NULL, &end, &start));
+      fprintf(fp, "%s\n", buf);
 
-  printf("Child process %ld finished executing\n", process_id);
-  // send elapsed time over pipe to parent
-  write (p[1], (char*) diff, MSGSIZE);
+      data_read = 0;
+      data_saved = 1;
+      fclose(fp);
+    }
 
-  return EXIT_SUCCESS;
+    pthread_mutex_unlock(&time_lock);
+  } while (data_saved != 1);
+
+  printf("Thread %i finished executing\n", thread_id);
+  return 0;
 }
 
 // calculate difference in time between end_time and start_time (return usec)
