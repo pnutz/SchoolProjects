@@ -84,6 +84,7 @@ int main (int argc, char *argv[])
   for (i = 0; i < count; i++)
   {
     pthread_create(&thread_id[i], NULL, child, (void*) info_ptr);
+    printf("Created thread %i\n", i);
   }
 
   parent(count);

@@ -1,5 +1,0 @@
-workerprocs
-gcc -Wall -o workerprocs workerprocs.c primedecompose.c -lgmp
-
-workerthreads
-gcc -Wall -o workerthreads workerthreads.c primedecompose.c -lgmp -lpthread

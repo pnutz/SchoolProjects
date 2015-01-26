@@ -74,7 +74,7 @@ int main (int argc, char *argv[])
     childpid = fork();
     if (childpid == 0) // child
     {
-     	fprintf(stderr, "Created child process %ld\n", (long) getpid());
+     	printf("Created child process %ld\n", (long) getpid());
 
       child(argv[1], pfd);
       break;
