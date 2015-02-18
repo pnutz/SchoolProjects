@@ -1,9 +1,0 @@
-# make for tcp_svr
-CC=gcc
-CFLAGS=-Wall -ggdb
-
-TARGET=tcp_svr
-
-$(TARGET): $(TARGET).c ; $(CC) $(CFLAGS) $(TARGET).c -o $(TARGET) -lrt
-
-clean: ; rm -f $(TARGET)
