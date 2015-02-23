@@ -56,7 +56,7 @@ typedef struct
 int main (int argc, char **argv)
 {
 	int thread_count, send_count, wait_time, port;
-	char *endptr, *host;
+	char *endptr, *host, *b;
   int base = 10;
 
   errno = 0;
@@ -116,7 +116,7 @@ int main (int argc, char **argv)
 			exit(1);
 	}
 
-  pthread_t thread_id[thread_count - 1];
+  pthread_t thread_id[thread_count];
   ThreadInfo *info_ptr;
 
   if ((info_ptr = malloc (sizeof (ThreadInfo))) == NULL)
@@ -132,13 +132,16 @@ int main (int argc, char **argv)
 
   int i;
   // create a thread for each client connection (parent thread counts as 1)
-  for (i = 0; i < thread_count - 1; i++)
+  for (i = 0; i < thread_count; i++)
   {
     pthread_create(&thread_id[i], NULL, openConnection, (void*) info_ptr);
     printf("Created thread %i\n", i);
   }
-  openConnection((void*) info_ptr);
-
+  
+  for (i = 0; i < thread_count; i++)
+  {
+    pthread_join(thread_id[i], (void**)&b);
+  }
 	return (0);
 }
 
