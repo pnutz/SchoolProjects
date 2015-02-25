@@ -42,7 +42,7 @@
 #define BUFLEN	255           // Buffer length
 #define TRUE	1
 #define PROCESS_COUNT 19
-#define BASE_THREAD_COUNT 10
+#define BASE_THREAD_COUNT 2
 #define MAX_THREAD_COUNT 100
 #define FILENAME "connections.txt"
 
@@ -136,8 +136,7 @@ int main (int argc, char **argv)
 	}
 
 	// Listen for connections
-	// queue up to PROCESS_COUNT+1 connect requests
-	listen(sd, PROCESS_COUNT + 1);
+	listen(sd, SOMAXCONN);
   
   for (i = 0; i < PROCESS_COUNT; i++)
   {
@@ -324,7 +323,7 @@ void* echo()
           exit(1);
         }
      
-        // loop until entire message received or 15 second timeout occurs
+        // loop until entire message received or 5 second timeout occurs
         while ((n = recv (new_sd, bp, bytes_to_read, 0)) < BUFLEN)
         {
           if (errno == EWOULDBLOCK)

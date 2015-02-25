@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------
---	SOURCE FILE:		select_svr.c -   A simple echo server using select
+--	SOURCE FILE:		epoll_svr.c -   A simple echo server using select
 --
 --	PROGRAM:		tsvr.exe
 --
@@ -26,15 +26,17 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <sys/epoll.h>
 #include <time.h>
 #include <sys/time.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <assert.h>
 
 #include "timer.h"
 
@@ -44,6 +46,7 @@
 #define THREAD_COUNT 10
 #define BASE_THREAD_COUNT 2
 #define MAX_THREAD_COUNT 25000/THREAD_COUNT
+#define EPOLL_QUEUE_LEN 25000
 #define FILENAME "connections.txt"
 
 // parameter for thread function
@@ -55,37 +58,35 @@ struct ThreadInfo {
 struct ReaderThread {
   pthread_t thread_id;
   int num_client;
-  int last_index;
   int num_thread;
-  int child_index; // equivalent to reader_index for child threads
 } ReaderThread;
 
-struct ChildThread {
-  pthread_t thread_id;
-  int sd;
+struct Client {
   struct sockaddr_in client;
   int bytes_sent;
   int num_requests;
-} ChildThread;
+} Client;
 
-// rwlock for rset/allset/reader_index
-pthread_rwlock_t rwlock;
-// struct containing assigned reader thread index, child thread accepts rset sd
+// mutex for reader_index and fd to pass to reader thread
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 int reader_index = -1;
-fd_set rset, allset;
-int maxfd;
+int new_fd;
 
-// rwlock for client
-pthread_rwlock_t child_rwlock[THREAD_COUNT];
 struct ReaderThread reader[THREAD_COUNT];
-struct ChildThread client[THREAD_COUNT][MAX_THREAD_COUNT];
+struct Client connection[EPOLL_QUEUE_LEN]; // index is fd
 
-int sd;
+pthread_t thread_id[THREAD_COUNT][MAX_THREAD_COUNT];
+
+int fd, main_epoll_fd;
+int epoll_fd[THREAD_COUNT];
+int pfd[THREAD_COUNT][2];
+int maxfd;
 
 int initOutputFile();
 int writeConnections();
-void* reader_method(void*);
+void* readerMethod(void*);
 void* echo(void*);
+void closeFd(int);
 //long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
 
 // print connection details on timeout
@@ -100,9 +101,12 @@ void handler(int sig, siginfo_t *si, void *uc)
 
 int main (int argc, char **argv)
 {
-	int	i, port, nready;
+	int	i, port, num_fds, client_index;
 	struct sockaddr_in server;
+  socklen_t client_len = sizeof(struct sockaddr_in);
   struct ThreadInfo *info_ptr[THREAD_COUNT];
+  struct sigaction act;
+  struct epoll_event events[1], event;
 
 	switch(argc)
 	{
@@ -117,11 +121,17 @@ int main (int argc, char **argv)
 			exit(1);
 	}
 
-  pthread_rwlock_init(&rwlock, NULL);
+  // setup the signal handler to close the server socket when CTRL-c is received
+  act.sa_handler = closeFd;
+  act.sa_flags = 0;
+  if ((sigemptyset(&act.sa_mask) == -1 || sigaction(SIGINT, &act, NULL) == -1))
+  {
+    perror("Failed to set SIGINT handler");
+    exit(1);
+  }
+
   for (i = 0; i < THREAD_COUNT; i++)
   {
-    pthread_rwlock_init(&child_rwlock[i], NULL);
-
     if ((info_ptr[i] = malloc(sizeof (struct ThreadInfo))) == NULL)
     {
       perror("malloc");
@@ -129,10 +139,17 @@ int main (int argc, char **argv)
     }
   }
 
+  // initialize connections
+  for (i = 0; i < EPOLL_QUEUE_LEN; i++)
+  {
+    connection[i].bytes_sent = -1;
+    connection[i].num_requests = 0;
+  }
+
   initOutputFile();
 
 	// Create a stream socket
-	if ((sd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+	if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
 	{
 		perror("Can't create a socket");
 		exit(1);
@@ -140,36 +157,50 @@ int main (int argc, char **argv)
 
   // reuse address socket option
   int arg = 1;
-  if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, &arg, sizeof(arg)) == -1)
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &arg, sizeof(arg)) == -1)
   {
     perror("Can't set socket option");
     exit(1);
   }
 
 	// Bind an address to the socket
-	bzero((char *)&server, sizeof(struct sockaddr_in));
+	memset(&server, 0, sizeof(struct sockaddr_in));
 	server.sin_family = AF_INET;
 	server.sin_port = htons(port);
 	server.sin_addr.s_addr = htonl(INADDR_ANY); // Accept connections from any client
 
-	if (bind(sd, (struct sockaddr *)&server, sizeof(server)) == -1)
+	if (bind(fd, (struct sockaddr *)&server, sizeof(server)) == -1)
 	{
 		perror("Can't bind name to socket");
 		exit(1);
 	}
 
 	// Listen for connections
-	// queue up to THREAD_COUNT connect requests
-	listen(sd, THREAD_COUNT);
-  
-  maxfd = sd;
-  FD_ZERO(&allset);
-  FD_SET(sd, &allset);
+	listen(fd, SOMAXCONN);
+  maxfd = fd + 1; 
 
+  main_epoll_fd = epoll_create(1);
+  if (main_epoll_fd == -1)
+  {
+    perror("epoll_create");
+    exit(1);
+  }
+
+  // add server socket to epoll event loop
+  event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+  event.data.fd = fd;
+  if (epoll_ctl(main_epoll_fd, EPOLL_CTL_ADD, fd, &event) == -1)
+  {
+    perror("epoll_ctl");
+    exit(1);
+  }
+ 
   for (i = 0; i < THREAD_COUNT; i++)
   {
     info_ptr[i]->thread_index = i;
-    pthread_create(&reader[i].thread_id, NULL, reader_method, (void*) info_ptr[i]);
+    pthread_create(&reader[i].thread_id, NULL, readerMethod, (void*) info_ptr[i]);
+    reader[i].num_client = 0;
+    reader[i].num_thread = BASE_THREAD_COUNT;
     printf("Created thread %lu %i\n", (unsigned long) reader[i].thread_id, i);
   }
 
@@ -177,38 +208,79 @@ int main (int argc, char **argv)
   timerinit(10, 0, handler);
   armTimer();
 
-  // setup select loop
   while (TRUE)
   {
-    pthread_rwlock_wrlock(&rwlock);
-    rset = allset;
-    while ((nready = select(maxfd + 1, &rset, NULL, NULL, NULL) == -1) && errno == EINTR)
+    num_fds = epoll_wait(main_epoll_fd, events, EPOLL_QUEUE_LEN, -1);
+    if (num_fds < 0 && errno != EINTR)
     {
-      continue;
+      perror("epoll_wait");
+      exit(1);
     }
 
-    if (reader_index == -1 && FD_ISSET(sd, &rset))
+    if (num_fds == 1)
     {
-      // set reader_index to thread with least connections from first thread
-      int least_clients = -1;
-      for (i = 0; i < THREAD_COUNT; i++)
+      // case 1: error condition
+      if (events[0].events & (EPOLLHUP | EPOLLERR))
       {
-        if (least_clients == -1)
-        {
-          reader_index = i;
-          least_clients = reader[i].num_client;
-        }
-        else if (reader[i].num_client < least_clients)
-        {
-          reader_index = i;
-          least_clients = reader[i].num_client;
-        }
+        perror("main_epoll_fd error");
+        close(events[0].data.fd);
+        continue;
       }
+      assert(events[0].events & EPOLLIN);
+
+      // case 2: connection request
+      if (events[0].data.fd == fd)
+      {
+        // find index in Client array to add
+        for (client_index = 0; client_index < EPOLL_QUEUE_LEN; client_index++)
+        {
+          if (connection[client_index].bytes_sent == -1)
+          {
+            break;
+          }
+        }        
+
+        pthread_mutex_lock(&mutex);
+        if (reader_index == -1)
+        {
+          new_fd = accept(fd, (struct sockaddr*) &connection[client_index].client, &client_len);
+          if (new_fd == -1)
+          {
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            {
+              perror("accept");
+            }
+            continue;
+          }
+
+          maxfd = new_fd + 1;
+          connection[new_fd].bytes_sent = 0;
+          connection[new_fd].num_requests = 0;
+
+          // find reader thread that will add new_fd to set
+          // set reader_index to thread with least connections from first thread
+          int least_clients = -1;
+          for (i = 0; i < THREAD_COUNT; i++)
+          {
+            if (least_clients == -1)
+            {
+              reader_index = i;
+              least_clients = reader[i].num_client;
+            }
+            else if (reader[i].num_client < least_clients)
+            {
+              reader_index = i;
+              least_clients = reader[i].num_client;
+            }
+          }
+          printf("%i reader index\n", reader_index);
+        }
+        pthread_mutex_unlock(&mutex);
+      } 
     }
-    pthread_rwlock_unlock(&rwlock);
   }
 
-	close(sd);
+	close(fd);
   for (i = 0; i < THREAD_COUNT; i++)
   {
     free(info_ptr[i]);
@@ -216,14 +288,22 @@ int main (int argc, char **argv)
   exit(0);
 }
 
-void* reader_method(void* info_ptr)
+void* readerMethod(void* info_ptr)
 {
   struct ThreadInfo* thread_info = (struct ThreadInfo*) info_ptr;
   int thread_index = thread_info->thread_index;
-  socklen_t client_len = sizeof(struct sockaddr_in);
-  int i, new_sd, child_index;
+  int i, num_fds;
   struct ThreadInfo *child_info_ptr[MAX_THREAD_COUNT];
+  struct epoll_event events[MAX_THREAD_COUNT], event;
 
+  // initialize pipe
+  if (pipe(pfd[thread_index]) < 0)
+  {
+    perror("pipe");
+    exit(1);
+  }
+
+  // allocate memory for arguments to child threads
   for (i = 0; i < MAX_THREAD_COUNT; i++)
   {
     if ((child_info_ptr[i] = malloc(sizeof (struct ThreadInfo))) == NULL)
@@ -233,55 +313,102 @@ void* reader_method(void* info_ptr)
     }  
   }
 
-  reader[thread_index].last_index = BASE_THREAD_COUNT;
-  reader[thread_index].num_thread = BASE_THREAD_COUNT;
-  reader[thread_index].num_client = 0;
-  reader[thread_index].child_index = -1;
-
   // initialize client with BASE_THREAD_COUNT threads
   for (i = 0; i < BASE_THREAD_COUNT; i++)
   {
     child_info_ptr[i]->parent_thread_index = thread_index;
     child_info_ptr[i]->thread_index = i;
-    pthread_create(&client[thread_index][i].thread_id, NULL, echo, (void*) child_info_ptr[i]);
-    //printf("Created thread %lu %i-%i\n", (unsigned long) client[thread_index][i].thread_id, thread_index, i);
+    pthread_create(&thread_id[thread_index][i], NULL, echo, (void*) child_info_ptr[i]);
+    //printf("Created thread %lu %i-%i\n", (unsigned long) thread_id[thread_index][i], thread_index, i);
+  }
 
-    client[thread_index][i].sd = -1;
-    client[thread_index][i].bytes_sent = 0;
-    client[thread_index][i].num_requests = 0;
+  // initialize epoll fd
+  epoll_fd[thread_index] = epoll_create(MAX_THREAD_COUNT);
+  if (epoll_fd[thread_index] == -1)
+  {
+    perror("epoll_create");
+    exit(1);
+  }
+
+  // make main_epoll_fd non-blocking
+  if (fcntl(main_epoll_fd, F_SETFL, O_NONBLOCK | fcntl(main_epoll_fd, F_GETFL, 0)) == -1)
+  {
+    perror("fcntl");
+    exit(1);
+  }
+
+  // add main fd to epoll loop
+  event.events = EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLET;
+  event.data.fd = main_epoll_fd;
+  if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, main_epoll_fd, &event) == -1)
+  {
+    perror("epoll_ctl");
+    exit(1);
   }
 
   while (TRUE)
   {
-    pthread_rwlock_rdlock(&rwlock);
-    // handle new connection
-    if (reader_index == thread_index)
+    num_fds = epoll_wait(epoll_fd[thread_index], events, MAX_THREAD_COUNT, -1);
+    if (num_fds < 0 && errno != EINTR)
     {
-      // find usable child thread, only reader can accept connections
-      pthread_rwlock_wrlock(&child_rwlock[thread_index]);
-      for (i = 0; i < reader[thread_index].last_index; i++)
+      perror("epoll_wait");
+      exit(1);
+    }
+
+    for (i = 0; i < num_fds; i++)
+    {
+      // case 1: error condition
+      if (events[i].events & (EPOLLHUP | EPOLLERR))
       {
-        if (client[thread_index][i].sd == -1)
+        perror("epoll_fd error");
+        close(events[i].data.fd);
+        continue;
+      }
+      assert(events[i].events & EPOLLIN);
+
+      // case 2: main fd read, new connection
+      if (events[i].data.fd == main_epoll_fd)
+      {
+        pthread_mutex_lock(&mutex);
+        // handle new connection
+        if (reader_index == thread_index)
         {
-          child_index = i;
-          reader[thread_index].child_index = i;
-          break;
+          // add new_fd to epoll set
+          // make new fd non-blocking
+          if (fcntl(new_fd, F_SETFL, O_NONBLOCK | fcntl(new_fd, F_GETFL, 0)) == -1)
+          {
+            perror("fcntl");
+            exit(1);
+          }
+
+          // add new fd to epoll loop
+          event.data.fd = new_fd;
+          if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, new_fd, &event) == -1)
+          {
+            perror("epoll_ctl");
+            exit(1);
+          }
+
+          printf("  Remote Address:  %s\n", inet_ntoa(connection[new_fd].client.sin_addr)); 
+          reader[thread_index].num_client++;
+          reader_index = -1;
         }
+        pthread_mutex_unlock(&mutex);
+        continue;
       }
 
-      if ((new_sd = accept(sd, (struct sockaddr *) &client[thread_index][child_index].client, &client_len)) == -1)
+      // case 3: read data for fd
+      if (write(pfd[thread_index][1], &events[i].data.fd, sizeof(events[i].data.fd)) < 0)
       {
-        perror("accept");
-        exit(1);
+        perror("write pipe");
       }
-      
-      client[thread_index][child_index].sd = new_sd;
-      client[thread_index][child_index].bytes_sent = 0;
-      client[thread_index][child_index].num_requests = 0;
-      reader[thread_index].num_client++;
+    }
+  
+    // compare num_fds (incoming data) w num threads
 
-      // buffer full of clients, create a new child thread 
-      if (reader[thread_index].num_client == reader[thread_index].num_thread && reader[thread_index].num_thread < MAX_THREAD_COUNT)
+      // buffer full of clients, create a new child thread
+      // change this based on epoll! 
+/*      if (reader[thread_index].num_client == reader[thread_index].num_thread && reader[thread_index].num_thread < MAX_THREAD_COUNT)
       {
         int new_thread_index;
         // if buffer reaches end of current list, extend list
@@ -306,31 +433,27 @@ void* reader_method(void* info_ptr)
         child_info_ptr[new_thread_index]->thread_index = new_thread_index;
         pthread_create(&client[thread_index][new_thread_index].thread_id, NULL, echo, (void*) child_info_ptr[new_thread_index]);
         reader[thread_index].num_thread++;
-        client[thread_index][new_thread_index].sd = -1;
+        client[thread_index][new_thread_index].fd = -1;
         client[thread_index][new_thread_index].bytes_sent = 0;
         client[thread_index][new_thread_index].num_requests = 0;
       
         printf("Created thread %lu %i\n", (unsigned long) client[thread_index][new_thread_index].thread_id, reader[thread_index].num_thread);
       }
 
-      pthread_rwlock_unlock(&child_rwlock[thread_index]);
-
-      FD_SET(new_sd, &allset);
-      if (new_sd > maxfd)
+      FD_SET(new_fd, &allset);
+      if (new_fd > maxfd)
       {
-        maxfd = new_sd;
+        maxfd = new_fd;
       }
       reader_index = -1;
     }
-    pthread_rwlock_unlock(&rwlock);
 
     // close excess threads (buffer of 5)
-    pthread_rwlock_wrlock(&child_rwlock[thread_index]);
     if (reader[thread_index].num_thread > BASE_THREAD_COUNT && reader[thread_index].num_client + 5 >= reader[thread_index].num_thread)
     {
       for (i = reader[thread_index].last_index - 1; i < 0; i--)
       {
-        if (client[thread_index][i].sd == -1)
+        if (client[thread_index][i].fd == -1)
         {
           printf("Cancelled thread %lu %i\n", client[thread_index][i].thread_id, reader[thread_index].num_thread);
           if (pthread_cancel(client[thread_index][i].thread_id) != 0)
@@ -343,68 +466,61 @@ void* reader_method(void* info_ptr)
           break;
         }
       }
-    }
-    pthread_rwlock_unlock(&child_rwlock[thread_index]);
+    }*/
   }
 
   for (i = 0; i < MAX_THREAD_COUNT; i++)
   {
     free(child_info_ptr[i]);
   }
+  return 0;
 }
 
 void* echo(void* info_ptr)
 {
   struct ThreadInfo* thread_info = (struct ThreadInfo *) info_ptr;
   int thread_index = thread_info->parent_thread_index;
-  int client_index = thread_info->thread_index;
-  int sd = -1;
 
+  int fd;
   int n, bytes_to_read;
-  char *bp, buf[BUFLEN];
+  char *bp, buf[BUFLEN], pipebuf[sizeof(int)];
 
   while (TRUE)
   {
-    // check to setup new connection
-    if (sd == -1)
-    {
-      pthread_rwlock_rdlock(&child_rwlock[thread_index]);
-      if (reader[thread_index].child_index == client_index)
-      {
-        sd = client[thread_index][client_index].sd;
+    read(pfd[thread_index][0], pipebuf, sizeof(int));
+    fd = atoi(pipebuf);
 
-        printf("%lu - Remote Address:  %s\n", (unsigned long) pthread_self(), inet_ntoa(client[thread_index][client_index].client.sin_addr));
-      }
-      pthread_rwlock_unlock(&child_rwlock[thread_index]);
-    }
-    else if (FD_ISSET(sd, &rset))
+    // delete thread
+    if (fd == -1)
     {
-      FD_CLR(sd, &rset);
+      reader[thread_index].num_thread--;
+      pthread_exit(NULL);
+    }
+    else if (fd > 0)
+    {
       bp = buf;
       bytes_to_read = BUFLEN;
       
       // loop until entire message received
-      while ((n = recv (sd, bp, bytes_to_read, 0)) < BUFLEN)
+      while ((n = recv (fd, bp, bytes_to_read, 0)) < BUFLEN)
       {
         bp += n;
         bytes_to_read -= n;
       }
      
-      client[thread_index][client_index].num_requests += 1;
-      //printf ("%i - Sending: %s\n", client[thread_index][child_index].thread_id, buf);
-      send (sd, buf, BUFLEN, 0);
-      client[thread_index][client_index].bytes_sent += BUFLEN;
+      connection[fd].num_requests += 1;
+      //printf ("Sending: %s\n", buf);
+      send (fd, buf, BUFLEN, 0);
+      connection[fd].bytes_sent += BUFLEN;
 
-      if (n == 0)
+      /*if (n == 0)
       {
-        pthread_rwlock_rdlock(&child_rwlock[thread_index]);
         //printf("%ld, %i - Closing Connection %i\n", (long) getpid(), thread_id, client_count);
         printf("Thread %i-%i completed a connection\n", thread_index, client_index);
-        close(sd);
-        client[thread_index][client_index].sd = -1;
+        close(fd);
+        client[thread_index][client_index].fd = -1;
         reader[thread_index].num_client--;
-        pthread_rwlock_unlock(&child_rwlock[thread_index]);
-      }
+      }*/
     }
   }
   return 0;
@@ -469,20 +585,23 @@ int writeConnections()
   gettimeofday(&tv, 0);
 
   // write connection details for active connections
-  int i, j;
-  for (i = 0; i < THREAD_COUNT; i++)
+  int i;
+  for (i = 0; i < maxfd; i++)
   {
-    for (j = 0; j < reader[i].last_index; j++)
+    if (connection[i].bytes_sent != -1)
     {
-      if (client[i][j].sd != -1 && client[i][j].bytes_sent != -1)
-      {
-        // print thread_conn[i] info
-        printf("%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, client[i][j].num_requests, 23, client[i][j].bytes_sent);
-        fprintf(file, "%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, client[i][j].num_requests, 23, client[i][j].bytes_sent);
-      }
+      // print thread_conn[i] info
+      printf("%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, connection[i].num_requests, 23, connection[i].bytes_sent);
+      fprintf(file, "%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, connection[i].num_requests, 23, connection[i].bytes_sent);
     }
   }
 
   fclose(file);
   return 0;
+}
+
+void closeFd(int signo)
+{
+  close(fd);
+  exit(EXIT_SUCCESS);
 }

@@ -41,6 +41,7 @@
 #define SERVER_TCP_PORT		7000	// Default port
 #define BUFLEN		      	255  	// Buffer length
 #define DATA              "DATA"
+#define FILENAME          "connections.txt"
 
 void* openConnection(void *);
 long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
@@ -52,6 +53,8 @@ typedef struct
   int* WaitTime;
   int* Port;
 } ThreadInfo;
+
+FILE *file;
 
 int main (int argc, char **argv)
 {
@@ -116,6 +119,12 @@ int main (int argc, char **argv)
 			exit(1);
 	}
 
+  if ((file = fopen(FILENAME, "w")) == NULL)
+  {
+    printf("Can't open output file: %s\n", FILENAME);
+    exit(1);
+  }
+
   pthread_t thread_id[thread_count];
   ThreadInfo *info_ptr;
 
@@ -142,6 +151,7 @@ int main (int argc, char **argv)
   {
     pthread_join(thread_id[i], (void**)&b);
   }
+  fclose(file);
 	return (0);
 }
 
@@ -226,7 +236,7 @@ void* openConnection(void *info_ptr)
     //printf("Round-Trip Time %i: %s\n", i, diff);
 
     printf("%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
-
+    fprintf(file, "%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
     // delay wait_time s
     sleep(*connection_info->WaitTime);
   }

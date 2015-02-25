@@ -26,7 +26,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <stdlib.h>
-#include <strings.h>
+#include <string.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -84,9 +84,10 @@ int sd;
 
 int initOutputFile();
 int writeConnections();
-void* reader_method(void*);
+void* readerMethod(void*);
 void* echo(void*);
-//long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
+void closeFd(int);
+long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
 
 // print connection details on timeout
 void handler(int sig, siginfo_t *si, void *uc)
@@ -103,6 +104,7 @@ int main (int argc, char **argv)
 	int	i, port, nready;
 	struct sockaddr_in server;
   struct ThreadInfo *info_ptr[THREAD_COUNT];
+  struct sigaction act;
 
 	switch(argc)
 	{
@@ -116,6 +118,15 @@ int main (int argc, char **argv)
 			fprintf(stderr, "Usage: %s [port]\n", argv[0]);
 			exit(1);
 	}
+
+  // setup the signal handler to close the server socket when CTRL-c is received
+  act.sa_handler = closeFd;
+  act.sa_flags = 0;
+  if ((sigemptyset(&act.sa_mask) == -1 || sigaction(SIGINT, &act, NULL) == -1))
+  {
+    perror("Failed to set SIGINT handler");
+    exit(1);
+  }
 
   pthread_rwlock_init(&rwlock, NULL);
   for (i = 0; i < THREAD_COUNT; i++)
@@ -146,8 +157,15 @@ int main (int argc, char **argv)
     exit(1);
   }
 
+  // make server listening socket non-blocking
+  if (fcntl(sd, F_SETFL, O_NONBLOCK | fcntl(sd, F_GETFL, 0)) == -1)
+  {
+    perror("fcntl");
+    exit(1);
+  }
+
 	// Bind an address to the socket
-	bzero((char *)&server, sizeof(struct sockaddr_in));
+	memset(&server, 0, sizeof(struct sockaddr_in));
 	server.sin_family = AF_INET;
 	server.sin_port = htons(port);
 	server.sin_addr.s_addr = htonl(INADDR_ANY); // Accept connections from any client
@@ -159,8 +177,7 @@ int main (int argc, char **argv)
 	}
 
 	// Listen for connections
-	// queue up to THREAD_COUNT connect requests
-	listen(sd, THREAD_COUNT);
+	listen(sd, SOMAXCONN);
   
   maxfd = sd;
   FD_ZERO(&allset);
@@ -169,7 +186,7 @@ int main (int argc, char **argv)
   for (i = 0; i < THREAD_COUNT; i++)
   {
     info_ptr[i]->thread_index = i;
-    pthread_create(&reader[i].thread_id, NULL, reader_method, (void*) info_ptr[i]);
+    pthread_create(&reader[i].thread_id, NULL, readerMethod, (void*) info_ptr[i]);
     printf("Created thread %lu %i\n", (unsigned long) reader[i].thread_id, i);
   }
 
@@ -216,7 +233,7 @@ int main (int argc, char **argv)
   exit(0);
 }
 
-void* reader_method(void* info_ptr)
+void* readerMethod(void* info_ptr)
 {
   struct ThreadInfo* thread_info = (struct ThreadInfo*) info_ptr;
   int thread_index = thread_info->thread_index;
@@ -359,6 +376,7 @@ void* echo(void* info_ptr)
   int thread_index = thread_info->parent_thread_index;
   int client_index = thread_info->thread_index;
   int sd = -1;
+  struct timeval start, end;
 
   int n, bytes_to_read;
   char *bp, buf[BUFLEN];
@@ -372,46 +390,77 @@ void* echo(void* info_ptr)
       if (reader[thread_index].child_index == client_index)
       {
         sd = client[thread_index][client_index].sd;
-
+        reader[thread_index].child_index = -1;
         printf("%lu - Remote Address:  %s\n", (unsigned long) pthread_self(), inet_ntoa(client[thread_index][client_index].client.sin_addr));
+
+        // set start time
+        if (gettimeofday(&start, NULL))
+        {
+          perror("start gettimeofday");
+          exit(1);
+        }
       }
       pthread_rwlock_unlock(&child_rwlock[thread_index]);
     }
-    else if (FD_ISSET(sd, &rset))
+    else
     {
-      FD_CLR(sd, &rset);
-      bp = buf;
-      bytes_to_read = BUFLEN;
-      
-      // loop until entire message received
-      while ((n = recv (sd, bp, bytes_to_read, 0)) < BUFLEN)
+      // get end time
+      if (gettimeofday(&end, NULL))
       {
-        bp += n;
-        bytes_to_read -= n;
+        perror("end gettimeofday");
+        exit(1);
       }
-     
-      client[thread_index][client_index].num_requests += 1;
-      //printf ("%i - Sending: %s\n", client[thread_index][child_index].thread_id, buf);
-      send (sd, buf, BUFLEN, 0);
-      client[thread_index][client_index].bytes_sent += BUFLEN;
 
-      if (n == 0)
+      // no message in 5 second timeout, close connection
+      if (timeval_diff(NULL, &end, &start) > 5000000LL)
       {
         pthread_rwlock_rdlock(&child_rwlock[thread_index]);
         //printf("%ld, %i - Closing Connection %i\n", (long) getpid(), thread_id, client_count);
         printf("Thread %i-%i completed a connection\n", thread_index, client_index);
         close(sd);
+        sd = -1;
         client[thread_index][client_index].sd = -1;
         reader[thread_index].num_client--;
         pthread_rwlock_unlock(&child_rwlock[thread_index]);
+      }     
+      else if (FD_ISSET(sd, &rset))
+      {
+        FD_CLR(sd, &rset);
+        bp = buf;
+        bytes_to_read = BUFLEN;
+        
+        // loop until entire message received
+        while ((n = recv (sd, bp, bytes_to_read, 0)) < BUFLEN)
+        {
+          bp += n;
+          bytes_to_read -= n;
+        }
+      
+        client[thread_index][client_index].num_requests += 1;
+        //printf ("%i - Sending: %s\n", client[thread_index][child_index].thread_id, buf);
+        send (sd, buf, BUFLEN, 0);
+        client[thread_index][client_index].bytes_sent += BUFLEN;
+
+        // set start time
+        if (gettimeofday(&start, NULL))
+        {
+          perror("start gettimeofday");
+          exit(1);
+        }
       }
     }
   }
   return 0;
 }
 
+void closeFd(int signo)
+{
+  close(sd);
+  exit(EXIT_SUCCESS);
+}
+
 // calculate difference in time between end_time and start_time (return usec)
-/*long long timeval_diff(struct timeval *difference, struct timeval *end_time, struct timeval *start_time)
+long long timeval_diff(struct timeval *difference, struct timeval *end_time, struct timeval *start_time)
 {
   struct timeval temp_diff;
 
@@ -420,17 +469,17 @@ void* echo(void* info_ptr)
     difference = &temp_diff;
   }
 
-  difference.tv_sec = end_time.tv_sec - start_time.tv_sec;
-  difference.tv_usec = end_time.tv_usec - start_time.tv_usec;
+  difference->tv_sec = end_time->tv_sec - start_time->tv_sec;
+  difference->tv_usec = end_time->tv_usec - start_time->tv_usec;
 
-  while (difference.tv_usec < 0)
+  while (difference->tv_usec < 0)
   {
-    difference.tv_usec += 1000000;
-    difference.tv_sec -= 1;
+    difference->tv_usec += 1000000;
+    difference->tv_sec -= 1;
   }
 
-  return 1000000LL * difference.tv_sec + difference.tv_usec;
-}*/
+  return 1000000LL * difference->tv_sec + difference->tv_usec;
+}
 
 int initOutputFile()
 {
