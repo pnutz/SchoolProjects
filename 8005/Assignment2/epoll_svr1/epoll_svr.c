@@ -146,7 +146,7 @@ int main (int argc, char **argv)
 	}
 
 	// Listen for connections
-	listen(fd, SOMAXCONN);
+	listen(fd, THREAD_COUNT);
   maxfd = fd + 1; 
   num_clients = 0;
 
@@ -160,16 +160,11 @@ int main (int argc, char **argv)
     printf("Created thread %lu %i\n", (unsigned long) thread_id[i], i);
   }
 
-  // join threads
-  for (i = 0; i < THREAD_COUNT; i++)
-  {
-    pthread_join(thread_id[i], NULL);
-  }
-
+  // can use this for printing
   // clean up timed out connections
   while (TRUE)
   {
-    if (gettimeofday(&current_time, NULL))
+/*    if (gettimeofday(&current_time, NULL))
     {
       perror("current_time gettimeofday");
       exit(1);
@@ -189,7 +184,7 @@ int main (int argc, char **argv)
         num_clients--;
         printf("Completed connection for fd %i\n", i);
       }
-    }
+    }*/
   }
 
 	close(fd);
@@ -312,23 +307,42 @@ static int echo(int fd)
     exit(1);
   }
 
-  while (TRUE)
+  bp = buf;
+  bytes_to_read = BUFLEN;
+
+  // receive initial BUFLEN of message
+  n = recv(fd, bp, bytes_to_read, 0);
+  // check if connection is closed
+  if (n == 0)
   {
-    bp = buf;
-    bytes_to_read = BUFLEN;
-    
+    if (maxfd - 1 == fd)
+    {
+      maxfd--;
+    }
+    connection[fd].bytes_sent = -1;
+    num_clients--;
+    printf("Completed connection for fd %i\n", fd);
+    close(fd);
+    return 1;
+  }
+
+  bp += n;
+  bytes_to_read -= n;
+
+  if (n < BUFLEN)
+  {
     // loop until entire message received
     while ((n = recv (fd, bp, bytes_to_read, 0)) < BUFLEN)
     {
       bp += n;
       bytes_to_read -= n;
     }
-   
-    connection[fd].num_requests += 1;
-    //printf ("Sending: %s\n", buf);
-    send (fd, buf, BUFLEN, 0);
-    connection[fd].bytes_sent += BUFLEN;
   }
+ 
+  connection[fd].num_requests += 1;
+  //printf ("Sending: %s\n", buf);
+  send (fd, buf, BUFLEN, 0);
+  connection[fd].bytes_sent += BUFLEN;
   return 0;
 }
 
