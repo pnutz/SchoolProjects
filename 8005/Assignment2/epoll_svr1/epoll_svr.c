@@ -340,7 +340,7 @@ static int echo(int fd)
   }
  
   connection[fd].num_requests += 1;
-  //printf ("Sending: %s\n", buf);
+  printf ("Sending: fd %i, request $%i - %s\n", fd, connection[fd].num_requests, buf);
   send (fd, buf, BUFLEN, 0);
   connection[fd].bytes_sent += BUFLEN;
   return 0;

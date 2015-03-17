@@ -1,4 +1,4 @@
-# make for tcp_svr
+# make for port_fwd
 CC=gcc
 CFLAGS=-Wall -ggdb
 
