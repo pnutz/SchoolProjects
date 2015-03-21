@@ -23,7 +23,6 @@
 ---------------------------------------------------------------------------------------*/
 #include <netdb.h>
 #include <stdio.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -199,7 +198,7 @@ void* acceptMethod(void* info_ptr)
   // free info_ptr after it was used
   free(info_ptr);
 
-  int num_fds;
+  int num_fds, conn, new_fd;
   struct epoll_event events[1], event;
 
   // initialize epoll fd
@@ -221,7 +220,7 @@ void* acceptMethod(void* info_ptr)
 
   while (TRUE)
   {
-    num_fds = epoll_wait(epoll_fd[thread_index], events, 1, 0);
+    num_fds = epoll_wait(epoll_fd[thread_index], events, 1, -1);
     if (num_fds < 0 && errno != EINTR)
     {
       perror("epoll_wait");
@@ -239,17 +238,25 @@ void* acceptMethod(void* info_ptr)
       assert(events[0].events & EPOLLIN);
 
       // case 2: connection request - check which port the request is coming from
-      int new_fd;
-      if (setupConn(&new_fd) == 1)
+      while (TRUE)
       {
-        exit(1);
+        if ((conn = setupConn(&new_fd)) == -1)
+        {
+          exit(1);
+        }
+        else if (conn == 0)
+        {
+          int target_thread = findFewestClients();
+
+          // send client & server fd down thread pipe
+          printf("write to %i pipe: %i\n", target_thread, new_fd);
+          write(fd_pipe[target_thread][1], &new_fd, sizeof(int));
+        }
+        else
+        {
+          break;
+        }
       }
-
-      int target_thread = findFewestClients();
-
-      // send client & server fd down thread pipe
-      printf("write to %i pipe: %i\n", target_thread, new_fd);
-      write(fd_pipe[target_thread][1], &new_fd, sizeof(int));
     }
   }
   return 0;
@@ -262,7 +269,7 @@ void* epollMethod(void* info_ptr)
   // free info_ptr after it was used
   free(info_ptr);
 
-  int i, new_fd, num_fds;
+  int i, new_fd, num_fds, conn;
   struct epoll_event events[THREAD_QUEUE_LEN], event;
 
   num_clients[thread_index] = 0;
@@ -300,7 +307,7 @@ void* epollMethod(void* info_ptr)
 
   while (TRUE)
   {
-    num_fds = epoll_wait(epoll_fd[thread_index], events, THREAD_QUEUE_LEN, -1);
+    num_fds = epoll_wait(epoll_fd[thread_index], events, THREAD_QUEUE_LEN, 0);
     if (num_fds < 0 && errno != EINTR)
     {
       perror("epoll_wait");
@@ -322,19 +329,28 @@ void* epollMethod(void* info_ptr)
       // case 2: connection request
       if (events[i].data.fd == fd)
       {
-        if (setupConn(&new_fd) == 1)
+        while (TRUE)
         {
-          exit(1);
-        }
+          if ((conn = setupConn(&new_fd)) == -1)
+          {
+            exit(1);
+          }
+          else if (conn == 0)
+          {
+            num_clients[thread_index]++;
 
-        num_clients[thread_index]++;
-
-        // add new fd to epoll loop
-        event.data.fd = new_fd;
-        if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, new_fd, &event) == -1)
-        {
-          perror("epoll_ctl");
-          exit(1);
+            // add new fd to epoll loop
+            event.data.fd = new_fd;
+            if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, new_fd, &event) == -1)
+            {
+              perror("epoll_ctl");
+              exit(1);
+            }
+          }
+          else
+          {
+            break;
+          }
         }
         continue;
       }
@@ -364,6 +380,7 @@ void* epollMethod(void* info_ptr)
 
 // accept client connection
 // init variables, modifies new_fd to point to clnt_fd
+// returns 0 if successful, 1 if accept would block, and -1 if an error occurred
 static int setupConn(int *new_fd)
 {
   int clnt_fd;
@@ -376,8 +393,12 @@ static int setupConn(int *new_fd)
     if (errno != EAGAIN && errno != EWOULDBLOCK)
     {
       perror("accept");
+      return -1;
     }
-    return 1;
+    else
+    {
+      return 1;
+    }
   }
 
   connection[clnt_fd].client = client;
@@ -388,7 +409,7 @@ static int setupConn(int *new_fd)
   if (fcntl(clnt_fd, F_SETFL, O_NONBLOCK | fcntl(clnt_fd, F_GETFL, 0)) == -1)
   {
     perror("fcntl");
-    return 1;
+    return -1;
   }
 
   printf("  Remote Address:  %s, %i\n", inet_ntoa(connection[clnt_fd].client.sin_addr), clnt_fd);
@@ -456,27 +477,13 @@ static int echo(int recv_fd, int thread_index)
 static int findFewestClients()
 {
   int i;
-  struct stat st;
   int index = 0;
-  if (fstat(fd_pipe[0][0], &st) < 0)
-  {
-    perror("fstat");
-    exit(1);
-  }
-  int pipe_count = st.st_size/(sizeof(int) * 2);
-  int count = num_clients[0] + pipe_count;
+  int count = num_clients[0];
   for (i = 1; i < THREAD_COUNT; i++)
   {
-    if (fstat(fd_pipe[i][0], &st) < 0)
+    if (num_clients[i] < count)
     {
-      perror("fstat");
-      exit(1);
-    }
-    pipe_count = st.st_size/(sizeof(int) * 2);
-
-    if (num_clients[i] + pipe_count < count)
-    {
-      count = num_clients[i] + pipe_count;
+      count = num_clients[i];
       index = i;
     }
   }

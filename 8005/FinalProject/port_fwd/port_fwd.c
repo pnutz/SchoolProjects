@@ -23,7 +23,6 @@
 ---------------------------------------------------------------------------------------*/
 #include <netdb.h>
 #include <stdio.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -205,7 +204,7 @@ void* acceptMethod(void* info_ptr)
   // free info_ptr after it was used
   free(info_ptr);
 
-  int i, j, num_fds;
+  int i, j, num_fds, conn, new_fd[2];
   struct epoll_event events[num_port_fwd], event;
 
   // initialize epoll fd
@@ -231,7 +230,7 @@ void* acceptMethod(void* info_ptr)
 
   while (TRUE)
   {
-    num_fds = epoll_wait(epoll_fd[thread_index], events, num_port_fwd, 0);
+    num_fds = epoll_wait(epoll_fd[thread_index], events, num_port_fwd, -1);
     if (num_fds < 0 && errno != EINTR)
     {
       perror("epoll_wait");
@@ -254,18 +253,26 @@ void* acceptMethod(void* info_ptr)
       {
         if (events[i].data.fd == port_config[j].fd)
         {
-          int new_fd[2];
-          if (setupConn(j, new_fd) == 1)
+          while (TRUE)
           {
-            exit(1);
+            if ((conn = setupConn(j, new_fd)) == -1)
+            {
+              exit(1);
+            }
+            else if (conn == 0)
+            {
+              int target_thread = findFewestClients();
+
+              // send client & server fd down thread pipe
+              printf("write to %i pipe: %i, %i\n", target_thread, new_fd[0], new_fd[1]);
+              write(fd_pipe[target_thread][1], &new_fd[0], sizeof(int));
+              write(fd_pipe[target_thread][1], &new_fd[1], sizeof(int));
+            }
+            else
+            {
+              break;
+            }
           }
-
-          int target_thread = findFewestClients();
-
-          // send client & server fd down thread pipe
-          printf("write to %i pipe: %i, %i\n", target_thread, new_fd[0], new_fd[1]);
-          write(fd_pipe[target_thread][1], &new_fd[0], sizeof(int));
-          write(fd_pipe[target_thread][1], &new_fd[1], sizeof(int));
           break;
         }
       }
@@ -281,7 +288,7 @@ void* epollMethod(void* info_ptr)
   // free info_ptr after it was used
   free(info_ptr);
 
-  int i, j, clnt_fd, svr_fd, num_fds, echo_flag;
+  int i, j, clnt_fd, svr_fd, num_fds, conn, echo_flag, new_fd[2];
   struct epoll_event events[THREAD_QUEUE_LEN], event;
 
   num_clients[thread_index] = 0;
@@ -348,31 +355,39 @@ void* epollMethod(void* info_ptr)
         if (events[i].data.fd == port_config[j].fd)
         {
           echo_flag = 0;
-          int new_fd[2];
-          if (setupConn(j, new_fd) == 1)
+          while (TRUE)
           {
-            exit(1);
-          }
+            if ((conn = setupConn(j, new_fd)) == -1)
+            {
+              exit(1);
+            }
+            else if (conn == 0)
+            {
+              num_clients[thread_index]++;
 
-          num_clients[thread_index]++;
+              clnt_fd = new_fd[0];
+              svr_fd = new_fd[1];
 
-          clnt_fd = new_fd[0];
-          svr_fd = new_fd[1];
+              // add new fd to epoll loop
+              event.data.fd = clnt_fd;
+              if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, clnt_fd, &event) == -1)
+              {
+                perror("epoll_ctl");
+                exit(1);
+              }
 
-          // add new fd to epoll loop
-          event.data.fd = clnt_fd;
-          if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, clnt_fd, &event) == -1)
-          {
-            perror("epoll_ctl");
-            exit(1);
-          }
-
-          // add new fd to epoll loop
-          event.data.fd = svr_fd;
-          if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, svr_fd, &event) == -1)
-          {
-            perror("epoll_ctl");
-            exit(1);
+              // add new fd to epoll loop
+              event.data.fd = svr_fd;
+              if (epoll_ctl(epoll_fd[thread_index], EPOLL_CTL_ADD, svr_fd, &event) == -1)
+              {
+                perror("epoll_ctl");
+                exit(1);
+              }
+            }
+            else
+            {
+              break;
+            }
           }
           break;
         }
@@ -418,6 +433,7 @@ void* epollMethod(void* info_ptr)
 
 // accept client connection, connect to server connection
 // init variables, modifies new_fd to point to array of int: clnt_fd, svr_fd
+// returns 0 if successful, 1 if accept would block, and -1 if an error occurred
 static int setupConn(int config_index, int *new_fd)
 {
   int clnt_fd, svr_fd;
@@ -431,8 +447,12 @@ static int setupConn(int config_index, int *new_fd)
     if (errno != EAGAIN && errno != EWOULDBLOCK)
     {
       perror("accept");
+      return -1;
     }
-    return 1;
+    else
+    {
+      return 1;
+    }
   }
 
   connection[clnt_fd].client = client;
@@ -443,7 +463,7 @@ static int setupConn(int config_index, int *new_fd)
   if (fcntl(clnt_fd, F_SETFL, O_NONBLOCK | fcntl(clnt_fd, F_GETFL, 0)) == -1)
   {
     perror("fcntl");
-    return 1;
+    return -1;
   }
 
   printf("  Remote Address:  %s\n", inet_ntoa(connection[clnt_fd].client.sin_addr));
@@ -452,7 +472,7 @@ static int setupConn(int config_index, int *new_fd)
   if ((svr_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
   {
     perror("Cannot create socket");
-    return 1;
+    return -1;
   }
 
   bzero((char *)&server, sizeof(struct sockaddr_in));
@@ -461,7 +481,7 @@ static int setupConn(int config_index, int *new_fd)
   if ((hp = gethostbyname(port_config[config_index].svr_addr)) == NULL)
   {
     fprintf(stderr, "Unknown server address\n");
-    return 1;
+    return -1;
   }
   bcopy(hp->h_addr, (char *)&server.sin_addr, hp->h_length);
 
@@ -470,7 +490,7 @@ static int setupConn(int config_index, int *new_fd)
   {
     fprintf(stderr, "Can't connect to server\n");
     perror("connect");
-    return 1;
+    return -1;
   }
 
   connection[svr_fd].client = server;
@@ -490,7 +510,7 @@ static int setupConn(int config_index, int *new_fd)
   if (fcntl(svr_fd, F_SETFL, O_NONBLOCK | fcntl(svr_fd, F_GETFL, 0)) == -1)
   {
     perror("fcntl");
-    return 1;
+    return -1;
   }
 
   printf("  Destination Address:  %s\n", inet_ntoa(connection[svr_fd].client.sin_addr));
@@ -568,27 +588,13 @@ static int echo(int recv_fd, int thread_index)
 static int findFewestClients()
 {
   int i;
-  struct stat st;
   int index = 0;
-  if (fstat(fd_pipe[0][0], &st) < 0)
-  {
-    perror("fstat");
-    exit(1);
-  }
-  int pipe_count = st.st_size/(sizeof(int) * 2);
-  int count = num_clients[0] + pipe_count;
+  int count = num_clients[0];
   for (i = 1; i < THREAD_COUNT; i++)
   {
-    if (fstat(fd_pipe[i][0], &st) < 0)
+    if (num_clients[i] < count)
     {
-      perror("fstat");
-      exit(1);
-    }
-    pipe_count = st.st_size/(sizeof(int) * 2);
-
-    if (num_clients[i] + pipe_count < count)
-    {
-      count = num_clients[i] + pipe_count;
+      count = num_clients[i];
       index = i;
     }
   }
