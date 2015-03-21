@@ -174,7 +174,7 @@ int main (int argc, char **argv)
 	pptr = hp->h_addr_list;
   sprintf(output, "Connected:    IP Address: %s", inet_ntop(hp->h_addrtype, *pptr, str, sizeof(str)));
   logstr(output);
-	printf("Connected:    IP Address: %s\n", inet_ntop(hp->h_addrtype, *pptr, str, sizeof(str)));
+	printf("Connected:    IP Address: %s\n", str);
 
   // variables for tcp
   int send_base; // sequence number

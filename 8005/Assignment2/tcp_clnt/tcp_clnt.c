@@ -128,21 +128,21 @@ int main (int argc, char **argv)
   pthread_t thread_id[thread_count];
   ThreadInfo *info_ptr;
 
-  if ((info_ptr = malloc (sizeof (ThreadInfo))) == NULL)
-  {
-    perror ("malloc");
-    exit (1);
-  }
-
-  info_ptr->Host = host;
-  info_ptr->SendCount = &send_count;
-  info_ptr->WaitTime = &wait_time;
-  info_ptr->Port = &port;
-
   int i;
   // create a thread for each client connection (parent thread counts as 1)
   for (i = 0; i < thread_count; i++)
   {
+    if ((info_ptr = malloc (sizeof (ThreadInfo))) == NULL)
+    {
+      perror ("malloc");
+      exit (1);
+    }
+
+    info_ptr->Host = host;
+    info_ptr->SendCount = &send_count;
+    info_ptr->WaitTime = &wait_time;
+    info_ptr->Port = &port;
+
     pthread_create(&thread_id[i], NULL, openConnection, (void*) info_ptr);
     printf("Created thread %i\n", i);
   }
@@ -158,11 +158,16 @@ int main (int argc, char **argv)
 void* openConnection(void *info_ptr)
 {
   ThreadInfo* connection_info = (ThreadInfo*) info_ptr;
+  int port = *connection_info->Port;
+  int send_count = *connection_info->SendCount;
+  int wait_time = *connection_info->WaitTime;
+  char *host = connection_info->Host;
+  free(info_ptr);
+
 	int sd, n, bytes_to_read;
 	struct hostent *hp;
 	struct sockaddr_in server;
-	char *bp, rbuf[BUFLEN], **pptr, diff[50];
-	char str[16];
+	char *bp, rbuf[BUFLEN], diff[50];
   struct timeval start, end;
 
   int data_sent = 0;
@@ -175,8 +180,8 @@ void* openConnection(void *info_ptr)
 	}
 	bzero((char *)&server, sizeof(struct sockaddr_in));
 	server.sin_family = AF_INET;
-	server.sin_port = htons(*connection_info->Port);
-	if ((hp = gethostbyname(connection_info->Host)) == NULL)
+	server.sin_port = htons(port);
+	if ((hp = gethostbyname(host)) == NULL)
 	{
 		fprintf(stderr, "Unknown server address\n");
 		exit(1);
@@ -191,11 +196,9 @@ void* openConnection(void *info_ptr)
 		exit(1);
 	}
 	printf("Connected:    Server Name: %s\n", hp->h_name);
-	pptr = hp->h_addr_list;
-	printf("\t\tIP Address: %s\n", inet_ntop(hp->h_addrtype, *pptr, str, sizeof(str)));
 
   int i;
-  for (i = 0; i < *connection_info->SendCount; i++)
+  for (i = 0; i < send_count; i++)
   {
     //printf("Transmit %i: %s\n", i, DATA);
 
@@ -238,7 +241,7 @@ void* openConnection(void *info_ptr)
     printf("%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
     fprintf(file, "%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
     // delay wait_time s
-    sleep(*connection_info->WaitTime);
+    sleep(wait_time);
   }
   printf("Closing connection\n");
 	close (sd);
