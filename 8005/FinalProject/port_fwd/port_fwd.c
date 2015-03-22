@@ -47,7 +47,7 @@
 #define THREAD_COUNT 8
 #define EPOLL_QUEUE_LEN 25000
 #define THREAD_QUEUE_LEN EPOLL_QUEUE_LEN/THREAD_COUNT
-#define FILENAME "connections.txt"
+#define FILENAME "port_fwd_connections.txt"
 
 // parameter for thread function
 struct ThreadInfo {
@@ -66,6 +66,13 @@ struct EndPointFd {
   int alt_fd;
 } EndPointFd;
 
+struct PrintData {
+  int recv_fd;
+  int send_fd;
+  int num_requests;
+  int bytes_sent;
+} PrintData;
+
 // listening socket, largest current fd
 int maxfd, epoll_fd[THREAD_COUNT + 1];
 int num_clients[THREAD_COUNT];
@@ -73,6 +80,7 @@ struct Client connection[EPOLL_QUEUE_LEN]; // index is fd
 struct EndPointFd end_point[EPOLL_QUEUE_LEN]; // index is fd
 pthread_t thread_id[THREAD_COUNT + 1];
 int fd_pipe[THREAD_COUNT][2];
+int out_pipe[2];
 
 void* acceptMethod(void*);
 void* epollMethod(void*);
@@ -80,8 +88,8 @@ static int setupConn(int, int*);
 static int echo(int, int);
 static int findFewestClients();
 //static long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
-int initOutputFile();
-int writeConnections();
+FILE* initOutputFile();
+int writeConnection(FILE*, int, int, int, int);
 void closeFd(int);
 
 int main (int argc, char **argv)
@@ -160,6 +168,13 @@ int main (int argc, char **argv)
 
   maxfd = fd + 1; 
 
+  // initialize out pipe
+  if (pipe(out_pipe) < 0)
+  {
+    perror("pipe call");
+    exit(1);
+  }
+
   // create child threads
   for (i = 0; i < THREAD_COUNT; i++)
   {
@@ -184,14 +199,25 @@ int main (int argc, char **argv)
   pthread_create(&thread_id[THREAD_COUNT], NULL, acceptMethod, (void*) info_ptr);
   printf("Created thread %lu %i\n", (unsigned long) thread_id[THREAD_COUNT], THREAD_COUNT);
 
-  //initOutputFile();
-
-  // log outputs to file
-  while (TRUE)
+  FILE *file;
+  if ((file = initOutputFile()) == NULL)
   {
-
+    perror("file");
+    exit(1);
   }
 
+  // log outputs to file
+  struct PrintData *print_data = malloc(sizeof(*print_data));
+  while (TRUE)
+  {
+    // read pipe
+    if (read(out_pipe[0], print_data, sizeof(*print_data)) > 0)
+    {
+      writeConnection(file, print_data->recv_fd, print_data->send_fd, print_data->num_requests, print_data->bytes_sent);
+    }
+  }
+
+  fclose(file);
 	close(fd);
   freePortFwdTable();
   exit(0);
@@ -577,9 +603,17 @@ static int echo(int recv_fd, int thread_index)
   }
  
   connection[end_point[recv_fd].alt_fd].num_requests += 1;
-  printf ("Sending: fd %i, request #%i - %s\n", end_point[recv_fd].alt_fd, connection[end_point[recv_fd].alt_fd].num_requests, buf);
+  //printf ("Sending: fd %i, request #%i - %s\n", end_point[recv_fd].alt_fd, connection[end_point[recv_fd].alt_fd].num_requests, buf);
   send (end_point[recv_fd].alt_fd, buf, BUFLEN, 0);
   connection[end_point[recv_fd].alt_fd].bytes_sent += BUFLEN;
+
+  struct PrintData *data = malloc(sizeof(*data));
+  data->recv_fd = recv_fd;
+  data->send_fd = end_point[recv_fd].alt_fd;
+  data->num_requests = connection[end_point[recv_fd].alt_fd].num_requests;
+  data->bytes_sent = connection[end_point[recv_fd].alt_fd].bytes_sent;
+  write(out_pipe[1], data, sizeof(*data));
+  free(data);
   return 0;
 }
 
@@ -623,35 +657,26 @@ static int findFewestClients()
   return 1000000LL * difference->tv_sec + difference->tv_usec;
 }*/
 
-int initOutputFile()
+FILE* initOutputFile()
 {
   FILE *file;
   if ((file = fopen(FILENAME, "w")) == NULL)
   {
     printf("Can't open output file: %s\n", FILENAME);
-    return 1;
+    return NULL;
   }
 
-  fprintf(file, "Time                  | Process | # Requests | Amt of Data Transferred\n");
-  fprintf(file, "______________________________________________________________________\n");
-
-  fclose(file);
-  return 0;
+  fprintf(file, "Time                  | ReceiveFD | SendFD | # Requests | Bytes Sent\n");
+  fprintf(file, "____________________________________________________________________\n");
+  return file;
 }
 
-int writeConnections()
+int writeConnection(FILE *file, int recv_fd, int send_fd, int num_requests, int bytes_sent)
 {
-  FILE *file;
   time_t timer;
   char time_buffer[25];
   struct tm *tm_info;
   struct timeval tv;
-
-  if ((file = fopen(FILENAME, "a")) == NULL)
-  {
-    printf("Can't open output file: %s\n", FILENAME);
-    return 1;
-  }
 
   time(&timer);
   tm_info = localtime(&timer);
@@ -659,19 +684,9 @@ int writeConnections()
 
   gettimeofday(&tv, 0);
 
-  // write connection details for active connections
-  int i;
-  for (i = 0; i < maxfd; i++)
-  {
-    if (connection[i].bytes_sent != -1)
-    {
-      // print thread_conn[i] info
-      printf("%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, connection[i].num_requests, 23, connection[i].bytes_sent);
-      fprintf(file, "%*s:%*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 10, connection[i].num_requests, 23, connection[i].bytes_sent);
-    }
-  }
-
-  fclose(file);
+  // write connection details
+  printf("%*s:%*i | %*i | %*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 9, recv_fd, 6, send_fd, 10, num_requests, 10, bytes_sent);
+  fprintf(file, "%*s:%*i | %*i | %*i | %*i | %*i\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 9, recv_fd, 6, send_fd, 10, num_requests, 10, bytes_sent);
   return 0;
 }
 

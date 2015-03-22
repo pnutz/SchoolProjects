@@ -41,26 +41,25 @@
 #define SERVER_TCP_PORT		7000	// Default port
 #define BUFLEN		      	255  	// Buffer length
 #define DATA              "DATA"
-#define FILENAME          "connections.txt"
+#define FILENAME          "clnt_connections.txt"
 
-void* openConnection(void *);
-long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
-
-typedef struct
-{
-  char* Host;
-  int* SendCount;
-  int* WaitTime;
-  int* Port;
+struct ThreadInfo {
+  int thread_index;
 } ThreadInfo;
 
+void* openConnection(void*);
+long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
+
+int send_count, wait_time, port;
+char *host;
 FILE *file;
 
 int main (int argc, char **argv)
 {
-	int thread_count, send_count, wait_time, port;
-	char *endptr, *host, *b;
+	int thread_count;
+	char *endptr, *b;
   int base = 10;
+  struct ThreadInfo *info_ptr;
 
   errno = 0;
 	switch(argc)
@@ -126,23 +125,17 @@ int main (int argc, char **argv)
   }
 
   pthread_t thread_id[thread_count];
-  ThreadInfo *info_ptr;
 
   int i;
   // create a thread for each client connection (parent thread counts as 1)
   for (i = 0; i < thread_count; i++)
   {
-    if ((info_ptr = malloc (sizeof (ThreadInfo))) == NULL)
+    if ((info_ptr = malloc(sizeof (struct ThreadInfo))) == NULL)
     {
-      perror ("malloc");
-      exit (1);
+      perror("malloc");
+      exit(1);
     }
-
-    info_ptr->Host = host;
-    info_ptr->SendCount = &send_count;
-    info_ptr->WaitTime = &wait_time;
-    info_ptr->Port = &port;
-
+    info_ptr->thread_index = i;
     pthread_create(&thread_id[i], NULL, openConnection, (void*) info_ptr);
     printf("Created thread %i\n", i);
   }
@@ -155,13 +148,10 @@ int main (int argc, char **argv)
 	return (0);
 }
 
-void* openConnection(void *info_ptr)
+void* openConnection(void* info_ptr)
 {
-  ThreadInfo* connection_info = (ThreadInfo*) info_ptr;
-  int port = *connection_info->Port;
-  int send_count = *connection_info->SendCount;
-  int wait_time = *connection_info->WaitTime;
-  char *host = connection_info->Host;
+  struct ThreadInfo *thread_info = (struct ThreadInfo*) info_ptr;
+  int thread_index = thread_info->thread_index;
   free(info_ptr);
 
 	int sd, n, bytes_to_read;
@@ -236,10 +226,8 @@ void* openConnection(void *info_ptr)
 
     // get elapsed time
     sprintf(diff, "%lld", timeval_diff(NULL, &end, &start));
-    //printf("Round-Trip Time %i: %s\n", i, diff);
-
-    printf("%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
-    fprintf(file, "%*i requests sent | %*i bytes sent | %*s echo time\n", 3, i+1, 6, data_sent, 7, diff);
+    printf("thread %*i | %*i requests sent | %*i bytes sent | %*s echo time\n", 5, thread_index, 3, i+1, 6, data_sent, 7, diff);
+    fprintf(file, "thread %*i | %*i requests sent | %*i bytes sent | %*s echo time\n", 5, thread_index, 3, i+1, 6, data_sent, 7, diff);
     // delay wait_time s
     sleep(wait_time);
   }
