@@ -464,8 +464,8 @@ static int setupConn(int config_index, int *new_fd)
 {
   int clnt_fd, svr_fd;
   struct sockaddr_in client, server;
-  struct hostent *hp;
   socklen_t client_len = sizeof(struct sockaddr_in);
+  struct addrinfo hints, *res, *rp;
 
   clnt_fd = accept(port_config[config_index].fd, (struct sockaddr*) &client, &client_len);
   if (clnt_fd == -1)
@@ -504,20 +504,28 @@ static int setupConn(int config_index, int *new_fd)
   bzero((char *)&server, sizeof(struct sockaddr_in));
   server.sin_family = AF_INET;
   server.sin_port = htons(port_config[config_index].svr_port);
-  if ((hp = gethostbyname(port_config[config_index].svr_addr)) == NULL)
-  {
-    fprintf(stderr, "Unknown server address\n");
-    return -1;
-  }
-  bcopy(hp->h_addr, (char *)&server.sin_addr, hp->h_length);
 
-  // open new connection to port forward server
-  if (connect(svr_fd, (struct sockaddr *)&server, sizeof(server)) == -1)
+  // replacing gethostbyname
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  getaddrinfo(port_config[config_index].svr_addr, NULL, &hints, &res);
+
+  for (rp = res; rp != NULL; rp = rp->ai_next)
   {
-    fprintf(stderr, "Can't connect to server\n");
-    perror("connect");
-    return -1;
+    struct sockaddr_in* saddr = (struct sockaddr_in*) rp->ai_addr;
+    server.sin_addr = saddr->sin_addr;
+ 
+    // Connecting to the server
+    if (connect (svr_fd, (struct sockaddr *)&server, sizeof(server)) == -1)
+    {
+      fprintf(stderr, "Can't connect to server\n");
+      perror("connect");
+      exit(1);
+    }
+    break;
   }
+  freeaddrinfo(res);
 
   connection[svr_fd].client = server;
   connection[svr_fd].bytes_sent = 0;
