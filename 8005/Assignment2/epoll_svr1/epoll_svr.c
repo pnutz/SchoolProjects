@@ -105,6 +105,10 @@ int main (int argc, char **argv)
     case 3:
       port = atoi(argv[1]);
       buflen = atoi(argv[2]); // get user specified buffer length
+      if (buflen > 1024)
+      {
+        fprintf(stderr, "Buffer length > 1024\n");
+      }
       break;
 		default:
 			fprintf(stderr, "Usage: %s [port] [buflen]\n", argv[0]);

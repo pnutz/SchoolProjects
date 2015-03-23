@@ -37,6 +37,7 @@
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <pthread.h>
+#include <signal.h>
 
 #define SERVER_TCP_PORT		7000	// Default port
 #define BUFLEN		      	255  	// Buffer length
@@ -49,8 +50,9 @@ struct ThreadInfo {
 
 void* openConnection(void*);
 long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
+void closeFd(int);
 
-int send_count, wait_time, port;
+int send_count, wait_time, port, buflen;
 char *host;
 FILE *file;
 
@@ -60,6 +62,7 @@ int main (int argc, char **argv)
 	char *endptr, *b;
   int base = 10;
   struct ThreadInfo *info_ptr;
+  struct sigaction act;
 
   errno = 0;
 	switch(argc)
@@ -85,6 +88,7 @@ int main (int argc, char **argv)
         exit(1);
       }
 			port = SERVER_TCP_PORT;
+      buflen = BUFLEN;
 		break;
 		case 6:
 			host = argv[1];
@@ -112,17 +116,67 @@ int main (int argc, char **argv)
         perror("strtol");
         exit(1);
       }
+      buflen = BUFLEN;
 		break;
+    case 7:
+			host = argv[1];
+      thread_count = strtol(argv[2], &endptr, base);
+      if (errno != 0 && thread_count == 0)
+      {
+        perror("strtol");
+        exit(1);
+      }
+      send_count = strtol(argv[3], &endptr, base);
+      if (errno != 0 && send_count == 0)
+      {
+        perror("strtol");
+        exit(1);
+      }
+      wait_time = strtol(argv[4], &endptr, base);
+      if (errno != 0 && wait_time == 0)
+      {
+        perror("strtol");
+        exit(1);
+      }
+			port = strtol(argv[5], &endptr, base);	// User specified port
+      if (errno != 0 && port == 0)
+      {
+        perror("strtol");
+        exit(1);
+      }
+      buflen = strtol(argv[6], &endptr, base);
+      if (errno != 0 && port == 0)
+      {
+        perror("strtol");
+        exit(1);
+      }
+      break;
 		default:
-			fprintf(stderr, "Usage: %s <host> <number of thread connections to create> <number of times to send string> <number of seconds to wait before sending next string> [port]\n", argv[0]);
+			fprintf(stderr, "Usage: %s <host> <number of thread connections to create> <number of times to send string> <number of seconds to wait before sending next string> [port] [buflen]\n", argv[0]);
 			exit(1);
 	}
+
+  if (buflen > 1024)
+  {
+    fprintf(stderr, "Buffer length > 1024\n");
+  }
+
+  // setup the signal handler to close the server socket when CTRL-c is received
+  act.sa_handler = closeFd;
+  act.sa_flags = 0;
+  if ((sigemptyset(&act.sa_mask) == -1 || sigaction(SIGINT, &act, NULL) == -1))
+  {
+    perror("Failed to set SIGINT handler");
+    exit(1);
+  }
 
   if ((file = fopen(FILENAME, "w")) == NULL)
   {
     printf("Can't open output file: %s\n", FILENAME);
     exit(1);
   }
+  fprintf(file, "Time                  | Thread | # Requests | Bytes Sent | Echo Time\n");
+  fprintf(file, "____________________________________________________________________\n");
 
   pthread_t thread_id[thread_count];
 
@@ -157,7 +211,7 @@ void* openConnection(void* info_ptr)
 	int sd, n, bytes_to_read;
 	struct hostent *hp;
 	struct sockaddr_in server;
-	char *bp, rbuf[BUFLEN], diff[50];
+	char *bp, rbuf[buflen], diff[50];
   struct timeval start, end;
 
   int data_sent = 0;
@@ -200,16 +254,16 @@ void* openConnection(void* info_ptr)
     }
 
     // Transmit data through the socket
-    send (sd, DATA, BUFLEN, 0);
+    send (sd, DATA, buflen, 0);
 
-    data_sent += BUFLEN;
+    data_sent += buflen;
     //printf("Receive %i:\n", i);
     bp = rbuf;
-    bytes_to_read = BUFLEN;
+    bytes_to_read = buflen;
 
     // client makes repeated calls to recv until no more data is expected to arrive.
     n = 0;
-    while ((n = recv (sd, bp, bytes_to_read, 0)) < BUFLEN)
+    while ((n = recv (sd, bp, bytes_to_read, 0)) < buflen)
     {
       bp += n;
       bytes_to_read -= n;
@@ -224,10 +278,20 @@ void* openConnection(void* info_ptr)
       exit(1);
     }
 
+    time_t timer;
+    char time_buffer[25];
+    struct tm *tm_info;
+    struct timeval tv;
+
+    time(&timer);
+    tm_info = localtime(&timer);
+    strftime(time_buffer, 25, "%D %T", tm_info);
+    gettimeofday(&tv, 0);
+
     // get elapsed time
     sprintf(diff, "%lld", timeval_diff(NULL, &end, &start));
-    printf("thread %*i | %*i requests sent | %*i bytes sent | %*s echo time\n", 5, thread_index, 3, i+1, 6, data_sent, 7, diff);
-    fprintf(file, "thread %*i | %*i requests sent | %*i bytes sent | %*s echo time\n", 5, thread_index, 3, i+1, 6, data_sent, 7, diff);
+    printf("%*s:%*i | %*i | %*i | %*i | %*s\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 6, thread_index, 10, i+1, 10, data_sent, 7, diff);
+    fprintf(file, "%*s:%*i | %*i | %*i | %*i | %*s\n", 17, time_buffer, 3, (int) tv.tv_usec % 1000, 6, thread_index, 10, i+1, 10, data_sent, 7, diff);
     // delay wait_time s
     sleep(wait_time);
   }
@@ -256,4 +320,10 @@ long long timeval_diff(struct timeval *difference, struct timeval *end_time, str
   }
 
   return 1000000LL * difference->tv_sec + difference->tv_usec;
+}
+
+void closeFd(int signo)
+{
+  fclose(file);
+  exit(EXIT_SUCCESS);
 }
