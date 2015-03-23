@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -209,11 +210,11 @@ void* openConnection(void* info_ptr)
   free(info_ptr);
 
 	int sd, n, bytes_to_read;
-	struct hostent *hp;
 	struct sockaddr_in server;
 	char *bp, rbuf[buflen], diff[50];
   struct timeval start, end;
-
+  struct addrinfo hints, *res, *rp;
+  
   int data_sent = 0;
 
 	// Create the socket
@@ -225,21 +226,29 @@ void* openConnection(void* info_ptr)
 	bzero((char *)&server, sizeof(struct sockaddr_in));
 	server.sin_family = AF_INET;
 	server.sin_port = htons(port);
-	if ((hp = gethostbyname(host)) == NULL)
-	{
-		fprintf(stderr, "Unknown server address\n");
-		exit(1);
-	}
-	bcopy(hp->h_addr, (char *)&server.sin_addr, hp->h_length);
 
-	// Connecting to the server
-	if (connect (sd, (struct sockaddr *)&server, sizeof(server)) == -1)
-	{
-		fprintf(stderr, "Can't connect to server\n");
-		perror("connect");
-		exit(1);
-	}
-	printf("Connected:    Server Name: %s\n", hp->h_name);
+  // replacing gethostbyname
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  getaddrinfo(host, NULL, &hints, &res);
+
+  for (rp = res; rp != NULL; rp = rp->ai_next)
+  {
+    struct sockaddr_in* saddr = (struct sockaddr_in*) rp->ai_addr;
+    server.sin_addr = saddr->sin_addr;
+ 
+    // Connecting to the server
+    if (connect (sd, (struct sockaddr *)&server, sizeof(server)) == -1)
+    {
+      fprintf(stderr, "Can't connect to server\n");
+      perror("connect");
+      exit(1);
+    }
+    printf("Connected:    Server Name: %s\n", inet_ntoa(saddr->sin_addr));
+    break;
+  }
+  freeaddrinfo(res);
 
   int i;
   for (i = 0; i < send_count; i++)
