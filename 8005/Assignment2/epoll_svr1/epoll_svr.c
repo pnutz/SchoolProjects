@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------
---	SOURCE FILE:		epoll_svr.c -   A simple echo server using select
+--	SOURCE FILE:		epoll_svr.c -   A simple echo server using epoll
 --
 --	PROGRAM:		tsvr.exe
 --

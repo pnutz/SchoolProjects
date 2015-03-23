@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------------------
---	SOURCE FILE:		epoll_svr.c -   A simple echo server using select
+--	SOURCE FILE:		epoll_svr.c -   A simple port forward server using epoll
 --
 --	PROGRAM:		tsvr.exe
 --
@@ -19,7 +19,7 @@
 --
 --	NOTES:
 --	The program will accept TCP connections from client machines.
--- The program will read data from the client socket and simply echo it back.
+-- The program will read data from the client socket and simply forward it to destination.
 ---------------------------------------------------------------------------------------*/
 #include <netdb.h>
 #include <stdio.h>
@@ -42,7 +42,7 @@
 
 #include "port_fwd_reader.c"
 
-#define BUFLEN	255           // Buffer length
+#define BUFLEN	5000           // Buffer length
 #define TRUE	1
 #define THREAD_COUNT 8
 #define EPOLL_QUEUE_LEN 25000
@@ -85,7 +85,7 @@ int out_pipe[2];
 void* acceptMethod(void*);
 void* epollMethod(void*);
 static int setupConn(int, int*);
-static int echo(int, int);
+static int forward(int, int);
 static int findFewestClients();
 //static long long timeval_diff(struct timeval*, struct timeval*, struct timeval*);
 FILE* initOutputFile();
@@ -314,7 +314,7 @@ void* epollMethod(void* info_ptr)
   // free info_ptr after it was used
   free(info_ptr);
 
-  int i, j, clnt_fd, svr_fd, num_fds, conn, echo_flag, new_fd[2];
+  int i, j, clnt_fd, svr_fd, num_fds, conn, fwd_flag, new_fd[2];
   struct epoll_event events[THREAD_QUEUE_LEN], event;
 
   num_clients[thread_index] = 0;
@@ -375,12 +375,12 @@ void* epollMethod(void* info_ptr)
       assert(events[i].events & EPOLLIN);
 
       // case 2: connection request - check which port the request is coming from
-      echo_flag = 1;
+      fwd_flag = 1;
       for (j = 0; j < num_port_fwd; j++)
       {
         if (events[i].data.fd == port_config[j].fd)
         {
-          echo_flag = 0;
+          fwd_flag = 0;
           while (TRUE)
           {
             if ((conn = setupConn(j, new_fd)) == -1)
@@ -420,9 +420,9 @@ void* epollMethod(void* info_ptr)
       }
 
       // case 3: read data for fd
-      if (echo_flag == 1)
+      if (fwd_flag == 1)
       {
-        echo(events[i].data.fd, thread_index);
+        forward(events[i].data.fd, thread_index);
       }
     }
 
@@ -554,7 +554,7 @@ static int setupConn(int config_index, int *new_fd)
   return 0;
 }
 
-static int echo(int recv_fd, int thread_index)
+static int forward(int recv_fd, int thread_index)
 {
   int n, bytes_to_read;
   char *bp, buf[BUFLEN];
@@ -594,8 +594,8 @@ static int echo(int recv_fd, int thread_index)
 
   if (n < BUFLEN)
   {
-    // loop until entire message received
-    while ((n = recv (recv_fd, bp, bytes_to_read, 0)) < BUFLEN)
+    // loop until entire message received or buffer is full
+    while ((n = recv (recv_fd, bp, bytes_to_read, 0)) < bytes_to_read && n != -1)
     {
       bp += n;
       bytes_to_read -= n;
@@ -604,8 +604,8 @@ static int echo(int recv_fd, int thread_index)
  
   connection[end_point[recv_fd].alt_fd].num_requests += 1;
   //printf ("Sending: fd %i, request #%i - %s\n", end_point[recv_fd].alt_fd, connection[end_point[recv_fd].alt_fd].num_requests, buf);
-  send (end_point[recv_fd].alt_fd, buf, BUFLEN, 0);
-  connection[end_point[recv_fd].alt_fd].bytes_sent += BUFLEN;
+  send (end_point[recv_fd].alt_fd, buf, BUFLEN - bytes_to_read, 0);
+  connection[end_point[recv_fd].alt_fd].bytes_sent += BUFLEN - bytes_to_read;
 
   struct PrintData *data = malloc(sizeof(*data));
   data->recv_fd = recv_fd;
