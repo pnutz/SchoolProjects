@@ -41,10 +41,10 @@
 #include <fcntl.h>
 
 #define SERVER_TCP_PORT 7000  // Default port
-#define BUFLEN	255           // Buffer length
+#define BUFLEN	5000           // Buffer length
 #define TRUE	1
 #define THREAD_COUNT 8
-#define EPOLL_QUEUE_LEN 25000
+#define EPOLL_QUEUE_LEN 80000
 #define THREAD_QUEUE_LEN EPOLL_QUEUE_LEN/THREAD_COUNT
 #define FILENAME "svr_connections.txt"
 
@@ -66,8 +66,8 @@ struct PrintData {
   int bytes_sent;
 } PrintData;
 
-// listening socket, largest current fd
-int fd, maxfd, buflen;
+// listening socket
+int fd;
 int num_clients[THREAD_COUNT];
 int epoll_fd[THREAD_COUNT + 1];
 struct Client connection[EPOLL_QUEUE_LEN]; // index is fd
@@ -96,22 +96,15 @@ int main (int argc, char **argv)
 	{
 		case 1:
 			port = SERVER_TCP_PORT;	// use the default port
-      buflen = BUFLEN; // use the default buflen
 		break;
 		case 2:
 			port = atoi(argv[1]);	// get user specified port
-      buflen = BUFLEN;
 		break;
     case 3:
       port = atoi(argv[1]);
-      buflen = atoi(argv[2]); // get user specified buffer length
-      if (buflen > 1024)
-      {
-        fprintf(stderr, "Buffer length > 1024\n");
-      }
       break;
 		default:
-			fprintf(stderr, "Usage: %s [port] [buflen]\n", argv[0]);
+			fprintf(stderr, "Usage: %s [port]\n", argv[0]);
 			exit(1);
 	}
 
@@ -166,7 +159,6 @@ int main (int argc, char **argv)
 
 	// Listen for connections
 	listen(fd, 128);
-  maxfd = fd + 1; 
 
   // initialize out_pipe
   if (pipe(out_pipe) < 0)
@@ -443,11 +435,6 @@ static int setupConn(int *new_fd)
 
   printf("  Remote Address:  %s, %i\n", inet_ntoa(connection[clnt_fd].client.sin_addr), clnt_fd);
 
-  if (maxfd <= clnt_fd)
-  {
-    maxfd = clnt_fd + 1;
-  }
-
   *new_fd = clnt_fd;
   return 0;
 }
@@ -455,7 +442,7 @@ static int setupConn(int *new_fd)
 static int echo(int recv_fd, int thread_index)
 {
   int n, bytes_to_read;
-  char *bp, buf[buflen];
+  char *bp, buf[BUFLEN];
   if (gettimeofday(&connection[recv_fd].last_seen, NULL))
   {
     perror("last_seen gettimeofday");
@@ -463,17 +450,13 @@ static int echo(int recv_fd, int thread_index)
   }
 
   bp = buf;
-  bytes_to_read = buflen;
+  bytes_to_read = BUFLEN;
 
-  // receive initial buflen of message
+  // receive initial BUFLEN of message
   n = recv(recv_fd, bp, bytes_to_read, 0);
   // check if connection is closed
   if (n == 0)
   {
-    if (maxfd - 1 == recv_fd)
-    {
-      maxfd--;
-    }
     connection[recv_fd].bytes_sent = -1;
     num_clients[thread_index]--;
     printf("Completed connection for fd %i\n", recv_fd);
@@ -484,10 +467,10 @@ static int echo(int recv_fd, int thread_index)
   bp += n;
   bytes_to_read -= n;
 
-  if (n < buflen)
+  if (n < BUFLEN)
   {
     // loop until entire message received
-    while ((n = recv (recv_fd, bp, bytes_to_read, 0)) < buflen)
+    while ((n = recv (recv_fd, bp, bytes_to_read, 0)) < bytes_to_read && n != -1)
     {
       bp += n;
       bytes_to_read -= n;
@@ -496,8 +479,8 @@ static int echo(int recv_fd, int thread_index)
  
   connection[recv_fd].num_requests += 1;
   //printf ("Sending: fd %i, request #%i - %s\n", recv_fd, connection[recv_fd].num_requests, buf);
-  send (recv_fd, buf, buflen, 0);
-  connection[recv_fd].bytes_sent += buflen;
+  send (recv_fd, buf, BUFLEN - bytes_to_read, 0);
+  connection[recv_fd].bytes_sent += BUFLEN - bytes_to_read;
 
   struct PrintData *data = malloc(sizeof(*data));
   data->fd = recv_fd;

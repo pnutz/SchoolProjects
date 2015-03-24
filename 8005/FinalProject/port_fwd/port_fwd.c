@@ -45,7 +45,7 @@
 #define BUFLEN	5000           // Buffer length
 #define TRUE	1
 #define THREAD_COUNT 8
-#define EPOLL_QUEUE_LEN 25000
+#define EPOLL_QUEUE_LEN 80000
 #define THREAD_QUEUE_LEN EPOLL_QUEUE_LEN/THREAD_COUNT
 #define FILENAME "port_fwd_connections.txt"
 
@@ -73,8 +73,7 @@ struct PrintData {
   int bytes_sent;
 } PrintData;
 
-// listening socket, largest current fd
-int maxfd, epoll_fd[THREAD_COUNT + 1];
+int epoll_fd[THREAD_COUNT + 1];
 int num_clients[THREAD_COUNT];
 struct Client connection[EPOLL_QUEUE_LEN]; // index is fd
 struct EndPointFd end_point[EPOLL_QUEUE_LEN]; // index is fd
@@ -165,8 +164,6 @@ int main (int argc, char **argv)
     // associate fd with port forward table
     port_config[i].fd = fd;
   }
-
-  maxfd = fd + 1; 
 
   // initialize out pipe
   if (pipe(out_pipe) < 0)
@@ -531,15 +528,6 @@ static int setupConn(int config_index, int *new_fd)
   connection[svr_fd].bytes_sent = 0;
   connection[svr_fd].num_requests = 0;
 
-  if (maxfd <= svr_fd)
-  {
-    maxfd = svr_fd + 1;
-  }
-  else if (maxfd <= clnt_fd)
-  {
-    maxfd = clnt_fd + 1;
-  }
-
   // make new fd non-blocking
   if (fcntl(svr_fd, F_SETFL, O_NONBLOCK | fcntl(svr_fd, F_GETFL, 0)) == -1)
   {
@@ -587,11 +575,6 @@ static int forward(int recv_fd, int thread_index)
     connection[end_point[recv_fd].alt_fd].bytes_sent = -1;
     printf("Completed connection for %s fd %i\n", (end_point[recv_fd].is_client) ? "client":"server", end_point[recv_fd].alt_fd);
     close(end_point[recv_fd].alt_fd);
-
-    if (maxfd - 1 == end_point[recv_fd].alt_fd || maxfd - 1 == recv_fd)
-    {
-      maxfd--;
-    }
 
     num_clients[thread_index]--;
     return 0;
