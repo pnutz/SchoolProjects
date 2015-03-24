@@ -156,11 +156,6 @@ int main (int argc, char **argv)
 			exit(1);
 	}
 
-  if (buflen > 1024)
-  {
-    fprintf(stderr, "Buffer length > 1024\n");
-  }
-
   // setup the signal handler to close the server socket when CTRL-c is received
   act.sa_handler = closeFd;
   act.sa_flags = 0;
